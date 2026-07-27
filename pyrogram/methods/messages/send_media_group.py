@@ -196,7 +196,7 @@ class SendMediaGroup:
                             raw.functions.messages.UploadMedia(
                                 peer=await self.resolve_peer(chat_id),
                                 media=raw.types.InputMediaUploadedPhoto(
-                                    file=await self.save_file(i.media),
+                                    file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                     spoiler=i.has_spoiler
                                 ),
                                 business_connection_id=business_connection_id
@@ -238,7 +238,7 @@ class SendMediaGroup:
                         raw.functions.messages.UploadMedia(
                             peer=await self.resolve_peer(chat_id),
                             media=raw.types.InputMediaUploadedPhoto(
-                                file=await self.save_file(i.media),
+                                file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                 spoiler=i.has_spoiler
                             ),
                             business_connection_id=business_connection_id
@@ -260,7 +260,7 @@ class SendMediaGroup:
                             raw.functions.messages.UploadMedia(
                                 peer=await self.resolve_peer(chat_id),
                                 media=raw.types.InputMediaUploadedDocument(
-                                    file=await self.save_file(i.media),
+                                    file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                     thumb=await self.save_file(i.thumb),
                                     spoiler=i.has_spoiler,
                                     mime_type=self.guess_mime_type(i.media) or "video/mp4",
@@ -314,7 +314,7 @@ class SendMediaGroup:
                         raw.functions.messages.UploadMedia(
                             peer=await self.resolve_peer(chat_id),
                             media=raw.types.InputMediaUploadedDocument(
-                                file=await self.save_file(i.media),
+                                file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                 thumb=await self.save_file(i.thumb),
                                 spoiler=i.has_spoiler,
                                 mime_type=self.guess_mime_type(getattr(i.media, "name", "video.mp4")) or "video/mp4",
@@ -349,7 +349,7 @@ class SendMediaGroup:
                                 peer=await self.resolve_peer(chat_id),
                                 media=raw.types.InputMediaUploadedDocument(
                                     mime_type=self.guess_mime_type(i.media) or "audio/mpeg",
-                                    file=await self.save_file(i.media),
+                                    file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                     thumb=await self.save_file(i.thumb),
                                     attributes=[
                                         raw.types.DocumentAttributeAudio(
@@ -397,7 +397,7 @@ class SendMediaGroup:
                             peer=await self.resolve_peer(chat_id),
                             media=raw.types.InputMediaUploadedDocument(
                                 mime_type=self.guess_mime_type(getattr(i.media, "name", "audio.mp3")) or "audio/mpeg",
-                                file=await self.save_file(i.media),
+                                file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                 thumb=await self.save_file(i.thumb),
                                 attributes=[
                                     raw.types.DocumentAttributeAudio(
@@ -427,7 +427,7 @@ class SendMediaGroup:
                                 peer=await self.resolve_peer(chat_id),
                                 media=raw.types.InputMediaUploadedDocument(
                                     mime_type=self.guess_mime_type(i.media) or "application/zip",
-                                    file=await self.save_file(i.media),
+                                    file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                     thumb=await self.save_file(i.thumb),
                                     attributes=[
                                         raw.types.DocumentAttributeFilename(file_name=i.file_name or os.path.basename(i.media))
@@ -472,7 +472,7 @@ class SendMediaGroup:
                                 mime_type=self.guess_mime_type(
                                     getattr(i.media, "name", "file.zip")
                                 ) or "application/zip",
-                                file=await self.save_file(i.media),
+                                file=await self.save_file(i.media, progress=progress, progress_args=progress_args),
                                 thumb=await self.save_file(i.thumb),
                                 attributes=[
                                     raw.types.DocumentAttributeFilename(file_name=i.file_name or getattr(i.media, "name", "file.zip"))

@@ -600,6 +600,16 @@ direct = create(direct_filter)
 
 # endregion
 
+# region entities_filter
+async def entities_filter(_, __, m: Message):
+    return bool(m.entities)
+
+
+entities = create(entities_filter)
+"""Filter text messages."""
+
+# endregion
+
 # region forum_filter
 async def forum_filter(_, __, m: Message):
     return bool(m.chat and m.chat.is_forum)

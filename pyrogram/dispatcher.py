@@ -92,6 +92,23 @@ from pyrogram.raw.types import (
 
 log = logging.getLogger(__name__)
 
+def _sort_groups(groups: OrderedDict) -> OrderedDict:
+    """对 groups 的 key 排序：数字 key 升序在前，字符串 key 按 (长度, 字典序) 在后。
+
+    支持字符串 group（如 'listen_xxx'）和数字 group 混用。
+    """
+    num_keys = []
+    str_keys = []
+    for k in groups:
+        if isinstance(k, (int, float)):
+            num_keys.append(k)
+        else:
+            str_keys.append(k)
+
+    num_keys.sort()
+    str_keys.sort(key=lambda x: (len(x), x))
+
+    return OrderedDict((k, groups[k]) for k in num_keys + str_keys)
 
 class Dispatcher:
     NEW_MESSAGE_UPDATES = (UpdateNewMessage, UpdateNewChannelMessage, UpdateNewScheduledMessage, UpdateNewEphemeralMessage)
@@ -398,6 +415,66 @@ class Dispatcher:
                     lock.release()
 
         self.client.loop.create_task(fn())
+
+    def remove_all_handler(self, group) -> asyncio.Task:
+        """移除指定 group 下的所有 handler，并取消其超时任务。
+
+        若 group 不存在则静默忽略（与老版本行为一致）。
+        """
+
+        async def fn():
+            async with self._groups_lock:
+                self.groups.pop(group, None)
+                self._cancel_timeout_task(group)
+
+        return self.client.loop.create_task(fn())
+
+    def _cancel_timeout_task(self, group):
+        """取消并清理指定 group 的超时任务（非协程，调用方需持有锁）。"""
+        task = self.timeout_tasks.pop(group, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _auto_remove_handler(self, group):
+        """等待超时时间后自动移除 group 的所有 handler。"""
+        try:
+            await asyncio.sleep(self.handler_timeout)
+        except asyncio.CancelledError:
+            # 任务被主动取消（被重置或被显式移除），清理交给取消方
+            return
+
+        try:
+            async with self._groups_lock:
+                self.groups.pop(group, None)
+            log.debug(
+                "Auto-removed handler group %s after %ss timeout",
+                group, self.handler_timeout,
+            )
+        except Exception as e:
+            log.warning("Failed to auto-remove group %s: %s", group, e)
+        finally:
+            # 走到这里说明 sleep 已正常结束，self.timeout_tasks[group] 必为自己
+            self.timeout_tasks.pop(group, None)
+
+    async def _resolve_args(self, handler, handler_type, parsed_update, update, users, chats):
+        """判断 handler 是否匹配本次 update，返回回调参数元组或 None。
+
+        check 异常向上抛，由调用方决定记录还是吞掉。
+        """
+        if isinstance(handler, handler_type):
+            if await handler.check(self.client, parsed_update):
+                return (parsed_update,)
+        elif isinstance(handler, RawUpdateHandler):
+            if await handler.check(self.client, update):
+                return (update, users, chats)
+        return None
+
+    async def _snapshot_groups(self):
+        """持锁拷出 groups 快照（连同每个 group 内部 list 一并浅拷），
+        worker 之后可以无锁迭代。"""
+        async with self._groups_lock:
+            return [list(group) for group in self.groups.values()]
+
 
     async def handler_worker(self, lock):
         while True:
