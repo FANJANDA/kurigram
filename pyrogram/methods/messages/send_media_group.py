@@ -59,6 +59,7 @@ class SendMediaGroup:
         parse_mode: Optional["enums.ParseMode"] = None,
         quote_entities: List["types.MessageEntity"] = None,
         quote_offset: int = None,
+        **kwargs
     ) -> List["types.Message"]:
         """Send a group of photos or videos as an album.
 
