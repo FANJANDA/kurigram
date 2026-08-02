@@ -135,14 +135,31 @@ class Dispatcher:
     MANAGED_BOT_UPDATES = (UpdateManagedBot,)
     GUEST_MESSAGE_UPDATES = (UpdateBotGuestChatQuery,)
 
+    # 默认豁免自动超时移除的 group（可通过 client.dispatcher_special_groups 覆盖）
+    DEFAULT_SPECIAL_GROUPS = frozenset({0, 1, 10})
+    # 默认 handler 超时时间（秒）
+    DEFAULT_HANDLER_TIMEOUT = 60
+
     def __init__(self, client: "pyrogram.Client"):
         self.client = client
 
         self.handler_worker_tasks = []
+        # 保留此属性，兼容可能读取 dispatcher.locks_list 的外部代码。
+        # groups 的并发修改统一由 _groups_lock 保护。
         self.locks_list = []
 
         self.updates_queue = asyncio.Queue()
         self.groups = OrderedDict()
+        self._groups_lock = asyncio.Lock()
+
+        self.special_groups = set(
+            getattr(client, "dispatcher_special_groups", self.DEFAULT_SPECIAL_GROUPS)
+        )
+        self.handler_timeout = getattr(
+            client, "handler_timeout", self.DEFAULT_HANDLER_TIMEOUT
+        )
+        # 每个 group 最多有一个自动移除任务。
+        self.timeout_tasks: Dict = {}
 
         async def message_parser(update, users, chats):
             return (
@@ -347,10 +364,8 @@ class Dispatcher:
 
         if not self.client.no_updates:
             for i in range(self.client.workers):
-                self.locks_list.append(asyncio.Lock())
-
                 self.handler_worker_tasks.append(
-                    self.client.loop.create_task(self.handler_worker(self.locks_list[-1]))
+                    self.client.loop.create_task(self.handler_worker())
                 )
 
             log.info("Started %s HandlerTasks", self.client.workers)
@@ -372,35 +387,57 @@ class Dispatcher:
             for i in self.handler_worker_tasks:
                 await i
 
-            if clear_handlers:
-                self.handler_worker_tasks.clear()
-                self.groups.clear()
-
+            # worker 已结束，重启时应创建一组全新的 worker task。
+            self.handler_worker_tasks.clear()
             log.info("Stopped %s HandlerTasks", self.client.workers)
 
-    def add_handler(self, handler: Handler, group: int):
-        async def fn():
-            for lock in self.locks_list:
-                await lock.acquire()
+        if clear_handlers:
+            # 自动移除任务不属于 worker，必须单独取消并等待，否则关闭后仍会运行。
+            timeout_tasks = list(self.timeout_tasks.values())
+            for task in timeout_tasks:
+                task.cancel()
+            if timeout_tasks:
+                await asyncio.gather(*timeout_tasks, return_exceptions=True)
+            self.timeout_tasks.clear()
 
-            try:
+            async with self._groups_lock:
+                self.groups.clear()
+
+    def is_excluded_group(self, group) -> bool:
+        """判断 group 是否豁免自动超时移除。"""
+        if group in self.special_groups:
+            return True
+
+        group_str = str(group)
+        return any(
+            keyword in group_str
+            for keyword in ("listen", "edit", "kw", "invite")
+        )
+
+    def add_handler(self, handler: Handler, group: int) -> asyncio.Task:
+        async def fn():
+            async with self._groups_lock:
                 if group not in self.groups:
                     self.groups[group] = []
-                    self.groups = OrderedDict(sorted(self.groups.items()))
+                    self.groups = _sort_groups(self.groups)
 
                 self.groups[group].append(handler)
-            finally:
-                for lock in self.locks_list:
-                    lock.release()
 
-        self.client.loop.create_task(fn())
+                # ErrorHandler 不参与临时 handler 的计时；新增普通 handler 时重置该组计时。
+                if (
+                    not isinstance(handler, ErrorHandler)
+                    and not self.is_excluded_group(group)
+                ):
+                    self._cancel_timeout_task(group)
+                    self.timeout_tasks[group] = self.client.loop.create_task(
+                        self._auto_remove_handler(group)
+                    )
 
-    def remove_handler(self, handler: Handler, group: int):
+        return self.client.loop.create_task(fn())
+
+    def remove_handler(self, handler: Handler, group: int) -> asyncio.Task:
         async def fn():
-            for lock in self.locks_list:
-                await lock.acquire()
-
-            try:
+            async with self._groups_lock:
                 if group not in self.groups:
                     raise ValueError(
                         f"Group {group} does not exist. Handler was not removed."
@@ -410,11 +447,9 @@ class Dispatcher:
 
                 if not self.groups[group]:
                     del self.groups[group]
-            finally:
-                for lock in self.locks_list:
-                    lock.release()
+                    self._cancel_timeout_task(group)
 
-        self.client.loop.create_task(fn())
+        return self.client.loop.create_task(fn())
 
     def remove_all_handler(self, group) -> asyncio.Task:
         """移除指定 group 下的所有 handler，并取消其超时任务。
@@ -437,24 +472,31 @@ class Dispatcher:
 
     async def _auto_remove_handler(self, group):
         """等待超时时间后自动移除 group 的所有 handler。"""
-        try:
-            await asyncio.sleep(self.handler_timeout)
-        except asyncio.CancelledError:
-            # 任务被主动取消（被重置或被显式移除），清理交给取消方
-            return
+        current_task = asyncio.current_task()
 
         try:
+            await asyncio.sleep(self.handler_timeout)
+
             async with self._groups_lock:
+                # 计时边界处可能已有新 handler 重置了任务；旧任务不能删新 group。
+                if self.timeout_tasks.get(group) is not current_task:
+                    return
+
                 self.groups.pop(group, None)
+                self.timeout_tasks.pop(group, None)
+
             log.debug(
                 "Auto-removed handler group %s after %ss timeout",
                 group, self.handler_timeout,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.warning("Failed to auto-remove group %s: %s", group, e)
         finally:
-            # 走到这里说明 sleep 已正常结束，self.timeout_tasks[group] 必为自己
-            self.timeout_tasks.pop(group, None)
+            # 只能清理自己，不能误删刚刚替换进来的新任务。
+            if self.timeout_tasks.get(group) is current_task:
+                self.timeout_tasks.pop(group, None)
 
     async def _resolve_args(self, handler, handler_type, parsed_update, update, users, chats):
         """判断 handler 是否匹配本次 update，返回回调参数元组或 None。
@@ -476,7 +518,7 @@ class Dispatcher:
             return [list(group) for group in self.groups.values()]
 
 
-    async def handler_worker(self, lock):
+    async def handler_worker(self):
         while True:
             packet = await self.updates_queue.get()
 
@@ -493,53 +535,45 @@ class Dispatcher:
                     else (None, type(None))
                 )
 
-                async with lock:
-                    for group in self.groups.values():
-                        for handler in group:
-                            if isinstance(handler, ErrorHandler):
-                                continue
+                groups_snapshot = await self._snapshot_groups()
 
-                            args = None
+                for group in groups_snapshot:
+                    for handler in group:
+                        if isinstance(handler, ErrorHandler):
+                            continue
 
-                            if isinstance(handler, handler_type):
-                                try:
-                                    if await handler.check(self.client, parsed_update):
-                                        args = (parsed_update,)
-                                except Exception as e:
-                                    log.exception(e)
-                                    continue
+                        try:
+                            args = await self._resolve_args(
+                                handler, handler_type, parsed_update,
+                                update, users, chats
+                            )
+                        except Exception as e:
+                            log.exception(e)
+                            continue
 
-                            elif isinstance(handler, RawUpdateHandler):
-                                try:
-                                    if await handler.check(self.client, update):
-                                        args = (update, users, chats)
-                                except Exception as e:
-                                    log.exception(e)
-                                    continue
+                        if args is None:
+                            continue
 
-                            if args is None:
-                                continue
-
-                            try:
-                                if inspect.iscoroutinefunction(handler.callback):
-                                    await handler.callback(self.client, *args)
-                                else:
-                                    await self.client.loop.run_in_executor(
-                                        self.client.executor,
-                                        handler.callback,
-                                        self.client,
-                                        *args
-                                    )
-                            except pyrogram.StopPropagation:
-                                raise
-                            except pyrogram.ContinuePropagation:
-                                continue
-                            except Exception as exc:
-                                await self.handle_update_handler_exception(
-                                    exc, handler, update, users, chats
+                        try:
+                            if inspect.iscoroutinefunction(handler.callback):
+                                await handler.callback(self.client, *args)
+                            else:
+                                await self.client.loop.run_in_executor(
+                                    self.client.executor,
+                                    handler.callback,
+                                    self.client,
+                                    *args
                                 )
+                        except pyrogram.StopPropagation:
+                            raise
+                        except pyrogram.ContinuePropagation:
+                            continue
+                        except Exception as exc:
+                            await self.handle_update_handler_exception(
+                                exc, handler, update, users, chats
+                            )
 
-                            break
+                        break
             except pyrogram.StopPropagation:
                 pass
             except Exception as e:
@@ -554,8 +588,9 @@ class Dispatcher:
         chats: Dict[int, "pyrogram.raw.base.Chat"]
     ) -> None:
         handled = False
+        groups_snapshot = await self._snapshot_groups()
         try:
-            for group in self.groups.values():
+            for group in groups_snapshot:
                 for handler in group:
                     if not isinstance(handler, ErrorHandler):
                         continue
