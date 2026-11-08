@@ -25,7 +25,8 @@ import pytest
 
 import pyrogram
 from pyrogram import StopTransmission, raw, types
-from pyrogram.methods.advanced.save_file import SaveFile
+from pyrogram.methods.advanced.save_file import UPLOAD_FLOOD_SLEEP_THRESHOLD, SaveFile
+from pyrogram.session import Session
 
 if TYPE_CHECKING:
     from concurrent.futures import Executor
@@ -49,11 +50,15 @@ class Media:
     def __init__(self, rejects_part: int | None = None) -> None:
         self.rejects_part = rejects_part
         self.saved_parts: list[int] = []
+        self.sleep_thresholds: list[float] = []
 
     async def invoke(
         self,
         query: raw.functions.upload.SaveFilePart | raw.functions.upload.SaveBigFilePart,
+        sleep_threshold: float = Session.SLEEP_THRESHOLD,
     ) -> None:
+        self.sleep_thresholds.append(sleep_threshold)
+
         if query.file_part == self.rejects_part:
             raise ConnectionError("the server closed the connection")
 
@@ -102,6 +107,20 @@ async def test_a_finished_upload_describes_every_part(three_parts: str) -> None:
     assert isinstance(file, raw.types.InputFile)
     assert file.parts == 3
     assert media.saved_parts == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_every_part_waits_out_a_flood_longer_than_the_session_default(
+    three_parts: str,
+) -> None:
+    # With the default threshold a `FLOOD_PREMIUM_WAIT_X` above 10s was raised for the part, and
+    #  the one lost part failed the whole upload instead of waiting it out.
+    media = Media()
+
+    await uploader(media).save_file(three_parts)
+
+    assert UPLOAD_FLOOD_SLEEP_THRESHOLD > Session.SLEEP_THRESHOLD
+    assert media.sleep_thresholds == [UPLOAD_FLOOD_SLEEP_THRESHOLD] * 3
 
 
 @pytest.mark.asyncio

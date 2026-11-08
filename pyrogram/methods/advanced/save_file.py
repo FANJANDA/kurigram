@@ -38,6 +38,12 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# `Session.invoke` sleeps through a flood wait only up to `Session.SLEEP_THRESHOLD` (10s) and
+#  raises above it. A part upload on a non-premium account is routinely answered with
+#  `FLOOD_PREMIUM_WAIT_X` well above that, and one raised part fails the whole file, so the parts
+#  wait for up to a minute instead, the same allowance `send_media_group` gives its own request.
+UPLOAD_FLOOD_SLEEP_THRESHOLD = 60
+
 
 class SaveFile:
     # The three shapes below are what the body already does, so a caller storing the result
@@ -150,7 +156,7 @@ class SaveFile:
                         return
 
                     try:
-                        await session.invoke(data)
+                        await session.invoke(data, sleep_threshold=UPLOAD_FLOOD_SLEEP_THRESHOLD)
                     except Exception as e:
                         # The failure is remembered rather than raised, because a worker that stops
                         #  consuming leaves the producer below blocked forever on `queue.put()`, since
