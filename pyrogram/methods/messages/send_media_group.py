@@ -21,19 +21,19 @@
 from __future__ import annotations as _annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pyrogram
 from pyrogram import raw, types, utils
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime, timedelta
 
 log = logging.getLogger(__name__)
 
 
 class SendMediaGroup:
-    # TODO: Add progress parameter
     async def send_media_group(
         self: pyrogram.Client,
         chat_id: int | str,
@@ -54,6 +54,9 @@ class SendMediaGroup:
         business_connection_id: str | None = None,
         allow_paid_broadcast: bool | None = None,
         paid_message_star_count: int | None = None,
+        progress: Callable | None = None,
+        progress_args: tuple = (),
+        **kwargs: Any,
     ) -> list[types.Message]:
         """Send a group of photos or videos as an album.
 
@@ -109,6 +112,33 @@ class SendMediaGroup:
             paid_message_star_count (``int``, *optional*):
                 The number of Telegram Stars the user agreed to pay to send the messages.
 
+            progress (``Callable``, *optional*):
+                Pass a callback function to view the file transmission progress.
+                The function must take *(current, total)* as positional arguments (look at Other Parameters below for a
+                detailed description) and will be called back each time a new file chunk has been successfully
+                transmitted. Each local file of the album is uploaded in turn, so *current* and *total* start over
+                for every one of them. Thumbnails and video covers are uploaded without it.
+
+            progress_args (``tuple``, *optional*):
+                Extra custom arguments for the progress callback function.
+                You can pass anything you need to be available in the progress callback scope; for example, a Message
+                object or a Client instance in order to edit the message with the updated progress status.
+
+            **kwargs (``Any``, *optional*):
+                Accepted and ignored, with a warning in the log, so a call written for an older signature (one of the
+                removed ``reply_to_*`` or ``quote_*`` parameters) still sends instead of raising ``TypeError``.
+
+        Other Parameters:
+            current (``int``):
+                The amount of bytes transmitted so far.
+
+            total (``int``):
+                The total size of the file.
+
+            *args (``tuple``, *optional*):
+                Extra custom arguments as defined in the ``progress_args`` parameter.
+                You can either keep ``*args`` or add every single extra argument in your function signature.
+
         Returns:
             List of :obj:`~pyrogram.types.Message`: On success, a list of the sent messages is returned.
 
@@ -129,6 +159,9 @@ class SendMediaGroup:
                     ]
                 )
         """
+        if kwargs:
+            log.warning("send_media_group ignored unknown arguments: %s", ", ".join(sorted(kwargs)))
+
         multi_media = []
 
         for i in media:
@@ -147,7 +180,12 @@ class SendMediaGroup:
 
             multi_media.append(
                 raw.types.InputSingleMedia(
-                    media=await i.write(client=self, chat_id=chat_id),
+                    media=await i.write(
+                        client=self,
+                        chat_id=chat_id,
+                        progress=progress,
+                        progress_args=progress_args,
+                    ),
                     random_id=self.rnd_id(),
                     **await utils.parse_text_entities(
                         self, i.caption, i.parse_mode, i.caption_entities

@@ -121,7 +121,13 @@ def parameters_the_caller_must_supply(shortcut: Shortcut) -> list[str]:
         filled_from_self(shortcut) | deprecated_in(sys.modules[target.__module__]) | {"self"}
     )
 
-    return [name for name in inspect.signature(target).parameters if name not in ignored]
+    # A `**kwargs` catch-all on the target (this fork's `send_media_group`) names no option a
+    #  shortcut could offer, so there is nothing for the shortcut to mirror.
+    return [
+        name
+        for name, parameter in inspect.signature(target).parameters.items()
+        if name not in ignored and parameter.kind is not inspect.Parameter.VAR_KEYWORD
+    ]
 
 
 def test_every_shortcut_is_discovered() -> None:
