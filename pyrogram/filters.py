@@ -352,6 +352,21 @@ text = create(text_filter)
 # endregion
 
 
+# region entities_filter
+async def entities_filter(_, __, message: Message):
+    return bool(message.entities)
+
+
+entities = create(entities_filter)
+"""Filter text messages that carry formatting entities (bold, links, mentions, ...).
+
+Only the entities of a message's text are looked at; those of a media caption are not.
+"""
+
+
+# endregion
+
+
 # region reply_filter
 async def reply_filter(_, __, message: Message):
     return bool(message.reply_to_message_id or message.reply_to_story_id)
