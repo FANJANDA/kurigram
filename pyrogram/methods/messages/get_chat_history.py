@@ -78,6 +78,59 @@ async def get_chunk(
 
 
 class GetChatHistory:
+    async def get_chat_messages(
+        self: pyrogram.Client,
+        chat_id: int | str,
+        start_id: int = 0,
+        end_id: int = 0,
+        reverse: bool = True,
+    ) -> AsyncGenerator[types.Message, None]:
+        """Get the messages of a chat by id, one :meth:`~pyrogram.Client.get_messages` call per id.
+
+        .. include:: /_includes/usable-by/users-bots.rst
+
+        Bots cannot use :meth:`~pyrogram.Client.get_chat_history`, but they can read a message
+        by its id, so this walks the ids from *start_id* to *end_id*, both included, instead.
+        Each id costs one request; prefer :meth:`~pyrogram.Client.get_chat_history` on a user
+        account.
+
+        Parameters:
+            chat_id (``int`` | ``str``):
+                Unique identifier (int) or username (str) of the target chat.
+                For your personal cloud (Saved Messages) you can simply use "me" or "self".
+                For a contact that exists in your Telegram address book you can use his phone number (str).
+
+            start_id (``int``, *optional*):
+                Identifier of the first message to read.
+
+            end_id (``int``, *optional*):
+                Identifier of the last message to read, included.
+
+            reverse (``bool``, *optional*):
+                Pass False to read from *end_id* down to *start_id*.
+                Defaults to True, from oldest to newest.
+
+        Returns:
+            ``Generator``: A generator yielding :obj:`~pyrogram.types.Message` objects. An id
+            with no message (deleted, or never sent) yields an ``empty`` one, so the caller sees
+            every id of the range.
+
+        Example:
+            .. code-block:: python
+
+                async for message in app.get_chat_messages(chat_id, start_id=1, end_id=100):
+                    print(message.id, message.empty)
+        """
+        ids = range(start_id, end_id + 1)
+
+        for message_id in ids if reverse else reversed(ids):
+            message = await self.get_messages(chat_id, message_id)
+
+            # `get_messages` answers `None` only when the server returned nothing at all for
+            #  the id; a deleted message comes back as an `empty` one and is yielded.
+            if message is not None:
+                yield message
+
     async def get_chat_history(
         self: pyrogram.Client,
         chat_id: int | str,

@@ -296,6 +296,7 @@ def pyrogram_api():
             get_media_group
             get_chat_history
             get_chat_history_count
+            get_chat_messages
             read_mentions
             read_reactions
             read_chat_history
