@@ -19,6 +19,7 @@
 from __future__ import annotations as _annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import threading
@@ -98,6 +99,28 @@ from pyrogram.raw.types import (
 
 log = logging.getLogger(__name__)
 
+# A group is an `int` as upstream has it, or a name such as `"listen-42"`: an application that
+#  registers handlers per task can then drop them all with `remove_all_handler("listen-42")`.
+HandlerGroup = int | str
+
+
+def _sort_groups(
+    groups: dict[HandlerGroup, list[Handler[Any]]],
+) -> dict[HandlerGroup, list[Handler[Any]]]:
+    """Numbered groups first, lowest first as upstream sorts them, then named ones.
+
+    A plain `sorted()` raises `TypeError` as soon as a name and a number are both registered.
+    Names come after every number and are ordered by length, then text, so `"kw-9"` runs before
+    `"kw-10"`.
+    """
+    numbered = sorted(group for group in groups if not isinstance(group, str))
+    named = sorted(
+        (group for group in groups if isinstance(group, str)),
+        key=lambda group: (len(group), group),
+    )
+
+    return {group: groups[group] for group in (*numbered, *named)}
+
 
 class Dispatcher:
     NEW_MESSAGE_UPDATES = (
@@ -139,15 +162,41 @@ class Dispatcher:
     GUEST_MESSAGE_UPDATES = (UpdateBotGuestChatQuery,)
     USER_TYPING_UPDATES = (UpdateUserTyping, UpdateChatUserTyping, UpdateChannelUserTyping)
 
+    # Every group not exempted here is temporary: `handler_timeout` seconds after a handler was
+    #  last added to it, the whole group is removed. An application registers a group per user
+    #  waiting to type an answer, and one the user never answers would otherwise stay forever.
+    #  A client attribute `dispatcher_special_groups` / `handler_timeout` replaces the default.
+    DEFAULT_SPECIAL_GROUPS: frozenset[HandlerGroup] = frozenset({0, 1, 10})
+    DEFAULT_HANDLER_TIMEOUT: float = 60
+    # A named group containing one of these is exempt too.
+    EXEMPT_GROUP_KEYWORDS: tuple[str, ...] = ("listen", "edit", "kw", "invite")
+
     def __init__(self, client: pyrogram.Client):
         self.client = client
+
+        self.special_groups: set[HandlerGroup] = set(
+            getattr(client, "dispatcher_special_groups", self.DEFAULT_SPECIAL_GROUPS)
+        )
+        self.handler_timeout: float = getattr(
+            client, "handler_timeout", self.DEFAULT_HANDLER_TIMEOUT
+        )
+
+        # The countdown of a temporary group is the token stored here, and the timer that fires
+        #  it carries the same token. Restarting or stopping a countdown replaces or drops the
+        #  token, so a timer that fires anyway, already queued or cancelled from another thread,
+        #  finds a different one and leaves the group alone. A token without a timer is a
+        #  countdown waiting for a loop to run on: `start()` arms it.
+        self._auto_remove_tokens: dict[HandlerGroup, object] = {}
+        self._auto_remove_timers: dict[
+            HandlerGroup, tuple[asyncio.AbstractEventLoop, asyncio.TimerHandle]
+        ] = {}
 
         self.handler_worker_tasks: list[asyncio.Task[None]] = []
 
         self.updates_queue: asyncio.Queue[
             tuple[raw.base.Update, dict[int, raw.base.User], dict[int, raw.base.Chat]] | None
         ] = asyncio.Queue()
-        self.groups: dict[int, list[Handler[Any]]] = {}
+        self.groups: dict[HandlerGroup, list[Handler[Any]]] = {}
 
         # `add_handler` is called from whatever thread the caller happens to be on, and every
         #  writer below reads `groups`, copies it and rebinds the attribute. Without this two
@@ -372,6 +421,16 @@ class Dispatcher:
     async def start(self):
         self._rebuild_loop_bound_state()
 
+        with self._groups_lock:
+            loop = asyncio.get_running_loop()
+
+            # Waiting countdowns, and any whose timer was left on a loop that is gone.
+            for group, token in self._auto_remove_tokens.items():
+                armed = self._auto_remove_timers.get(group)
+
+                if armed is None or armed[0] is not loop:
+                    self._arm_countdown(loop, group, token)
+
         # Open before `start_handler`, not when the workers exist: an update arriving while it
         #  runs is delivered once they start, and its `pts` is already saved by then.
         self._accepting_updates = not self.client.no_updates
@@ -417,6 +476,20 @@ class Dispatcher:
 
             log.info("Stopped %s HandlerTasks", self.client.workers)
 
+        # A countdown is a timer on the loop this ran on, and the next `start()` may run on
+        #  another one, so every timer stops here. A group that survives keeps its token and
+        #  `start()` gives it a full timeout again; a group cleared above takes its token along.
+        with self._groups_lock:
+            for loop, timer in self._auto_remove_timers.values():
+                self._cancel_timer(loop, timer)
+
+            self._auto_remove_timers.clear()
+            self._auto_remove_tokens = {
+                group: token
+                for group, token in self._auto_remove_tokens.items()
+                if group in self.groups
+            }
+
     def enqueue(
         self,
         update: raw.base.Update,
@@ -432,14 +505,19 @@ class Dispatcher:
 
         self.updates_queue.put_nowait((update, users, chats))
 
-    def add_handler(self, handler: Handler[Any], group: int) -> None:
+    def add_handler(self, handler: Handler[Any], group: HandlerGroup) -> None:
         with self._groups_lock:
             groups = self._copy_groups()
             groups.setdefault(group, []).append(handler)
 
-            self.groups = dict(sorted(groups.items()))
+            self.groups = _sort_groups(groups)
 
-    def remove_handler(self, handler: Handler[Any], group: int) -> None:
+            # An `ErrorHandler` is not what keeps a temporary group in use, so it neither starts
+            #  nor extends the countdown.
+            if not isinstance(handler, ErrorHandler) and not self.is_excluded_group(group):
+                self._restart_countdown(group)
+
+    def remove_handler(self, handler: Handler[Any], group: HandlerGroup) -> None:
         with self._groups_lock:
             if group not in self.groups:
                 raise ValueError(f"Group {group} does not exist. Handler was not removed.")
@@ -449,12 +527,118 @@ class Dispatcher:
 
             if not groups[group]:
                 del groups[group]
+                self._stop_countdown(group)
 
             self.groups = groups
 
-    def _copy_groups(self) -> dict[int, list[Handler[Any]]]:
+    def remove_all_handler(self, group: HandlerGroup) -> None:
+        """Remove every handler of a group at once, and stop its countdown.
+
+        Unlike `remove_handler`, a group that does not exist is not an error: the caller is
+        usually cleaning up after a group that its countdown may already have removed.
+        """
+        with self._groups_lock:
+            if group in self.groups:
+                groups = self._copy_groups()
+                del groups[group]
+                self.groups = groups
+
+            self._stop_countdown(group)
+
+    def is_excluded_group(self, group: HandlerGroup) -> bool:
+        """Whether the handlers of `group` stay until removed instead of timing out."""
+        if group in self.special_groups:
+            return True
+
+        return isinstance(group, str) and any(
+            keyword in group for keyword in self.EXEMPT_GROUP_KEYWORDS
+        )
+
+    def _copy_groups(self) -> dict[HandlerGroup, list[Handler[Any]]]:
         """A copy the registration methods edit, so a dispatching worker keeps the old one."""
         return {group: list(handlers) for group, handlers in self.groups.items()}
+
+    # The countdown methods below expect `_groups_lock` to be held, except the two a timer or
+    #  another thread calls on the loop, `_arm_countdown_on_loop` and `_auto_remove_handler`,
+    #  which take it themselves.
+    def _restart_countdown(self, group: HandlerGroup) -> None:
+        self._stop_countdown(group)
+
+        token = object()
+        self._auto_remove_tokens[group] = token
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Not on a loop: the thread of a caller that registers from outside, or no loop
+            #  yet. The loop the client runs on arms it, and if the client has not started
+            #  `start()` does.
+            loop = self.client._loop
+
+            if loop is not None and loop.is_running():
+                # A loop closing under us leaves the token waiting, as if it had not started.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(self._arm_countdown_on_loop, group, token)
+
+            return
+
+        self._arm_countdown(loop, group, token)
+
+    def _arm_countdown(
+        self, loop: asyncio.AbstractEventLoop, group: HandlerGroup, token: object
+    ) -> None:
+        timer = loop.call_later(self.handler_timeout, self._auto_remove_handler, group, token)
+        self._auto_remove_timers[group] = (loop, timer)
+
+    def _arm_countdown_on_loop(self, group: HandlerGroup, token: object) -> None:
+        with self._groups_lock:
+            if self._auto_remove_tokens.get(group) is token:
+                self._arm_countdown(asyncio.get_running_loop(), group, token)
+
+    def _stop_countdown(self, group: HandlerGroup) -> None:
+        self._auto_remove_tokens.pop(group, None)
+        armed = self._auto_remove_timers.pop(group, None)
+
+        if armed is not None:
+            self._cancel_timer(*armed)
+
+    @staticmethod
+    def _cancel_timer(loop: asyncio.AbstractEventLoop, timer: asyncio.TimerHandle) -> None:
+        # The token already keeps a stale timer from removing anything; cancelling only spares
+        #  the loop the call. `TimerHandle.cancel()` is not thread safe, so another thread asks
+        #  the loop to do it.
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if running is loop:
+            timer.cancel()
+            return
+
+        # A closed loop runs nothing, this timer included.
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(timer.cancel)
+
+    def _auto_remove_handler(self, group: HandlerGroup, token: object) -> None:
+        """Remove a temporary group whose countdown ran out."""
+        with self._groups_lock:
+            if self._auto_remove_tokens.get(group) is not token:
+                return
+
+            del self._auto_remove_tokens[group]
+            self._auto_remove_timers.pop(group, None)
+
+            if group not in self.groups:
+                return
+
+            groups = self._copy_groups()
+            del groups[group]
+            self.groups = groups
+
+        log.debug(
+            "Removed handler group %s after %ss without a new handler", group, self.handler_timeout
+        )
 
     async def handler_worker(self) -> None:
         while True:

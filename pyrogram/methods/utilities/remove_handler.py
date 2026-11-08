@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 
 class RemoveHandler:
-    def remove_handler(self: pyrogram.Client, handler: Handler, group: int = 0):
+    def remove_handler(self: pyrogram.Client, handler: Handler, group: int | str = 0):
         """Remove a previously-registered update handler.
 
         Make sure to provide the right group where the handler was added in. You can use the return value of the
@@ -38,8 +38,9 @@ class RemoveHandler:
             handler (``Handler``):
                 The handler to be removed.
 
-            group (``int``, *optional*):
+            group (``int`` | ``str``, *optional*):
                 The group identifier, defaults to 0.
+                A named group (``str``) is dispatched after every numbered one.
 
         Example:
             .. code-block:: python

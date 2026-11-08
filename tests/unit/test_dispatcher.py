@@ -83,7 +83,7 @@ def test_a_handler_registered_outside_a_loop_survives_into_one(client: Client) -
 
     client.add_handler(handler)
 
-    async def registered() -> dict[int, list[Handler[Any]]]:
+    async def registered() -> dict[int | str, list[Handler[Any]]]:
         return client.dispatcher.groups
 
     assert asyncio.run(registered()) == {0: [handler]}

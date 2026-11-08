@@ -28,7 +28,9 @@ if TYPE_CHECKING:
 
 
 class AddHandler:
-    def add_handler(self: pyrogram.Client, handler: Handler, group: int = 0) -> tuple[Handler, int]:
+    def add_handler(
+        self: pyrogram.Client, handler: Handler, group: int | str = 0
+    ) -> tuple[Handler, int | str]:
         """Register an update handler.
 
         You can register multiple handlers, but at most one handler within a group will be used for a single update.
@@ -40,8 +42,9 @@ class AddHandler:
             handler (``Handler``):
                 The handler to be registered.
 
-            group (``int``, *optional*):
+            group (``int`` | ``str``, *optional*):
                 The group identifier, defaults to 0.
+                A named group (``str``) is dispatched after every numbered one.
 
         Returns:
             ``tuple``: A tuple consisting of *(handler, group)*.
